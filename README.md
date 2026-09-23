@@ -35,6 +35,20 @@ reader.count                     # 已产出的记录条数
 
 **分块边界不保证落在行边界上，也不保证落在字符边界上**，调用方不要对块内容做任何假设。
 
+## 验收入口
+
+`bench.py` 是判据脚本，**不要改**：
+
+```bash
+python3 bench.py --check    # 同一份数据按多种块大小读，结果必须逐条一致
+python3 bench.py --bench    # 长记录 + 1 字节块，必须在 TIME_LIMIT 内读完
+python3 repro.py            # 上游给的复现脚本，必须读出 7 条
+```
+
+`--bench` 的场景是上游真实会遇到的：agent 用小缓冲逐字节推送，而单条记录可能很大
+（这里压到 1 MiB）。**小块吞吐和"结果正确"一样是硬要求**，`TIME_LIMIT` 见 `bench.py`
+文件头。
+
 ## 输入约定
 
 1. 编码 UTF-8，文件可以带 BOM。
@@ -53,5 +67,7 @@ streamndjson/
   source.py     iter_chunks
 tests/          既有用例
 testdata/       样例数据（中文、emoji、超长行、BOM）
+bench.py        验收入口：--check 差分对拍 / --bench 小块吞吐
 repro.py        上游给的复现脚本
+tools/          手工观察用的小工具
 ```
