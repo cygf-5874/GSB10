@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streamndjson"
+version = "0.3.1"
+description = "Incremental NDJSON reader for chunked byte streams (stdlib only)"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+packages = ["streamndjson"]
