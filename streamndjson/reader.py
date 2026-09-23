@@ -4,6 +4,12 @@ import json
 
 from .errors import StreamDecodeError
 
+_BOM = b"\xef\xbb\xbf"
+_NEWLINE = b"\n"
+
+#: 已消费前缀超过这个阈值才搬移缓冲，避免残留大行时反复 memmove。
+_COMPACT_THRESHOLD = 64 * 1024
+
 
 class NDJSONReader:
     """增量解析换行分隔的 JSON 对象。
@@ -18,12 +24,16 @@ class NDJSONReader:
             handle(record)
 
     每一行必须是一个 JSON 对象；空行忽略；其余情况抛 :class:`StreamDecodeError`。
+    块边界可以落在任意字节上（包括多字节字符中间）。
     """
 
     def __init__(self):
-        self._buf = ""
+        self._buf = bytearray()
+        self._head = 0       # 缓冲里未消费数据的起点
+        self._scan = 0       # 下一个待查找 \\n 的位置（之前的字节已确认不含 \\n）
         self._count = 0
         self._closed = False
+        self._bom_done = False
 
     # -- 输入 ---------------------------------------------------------
 
@@ -33,34 +43,80 @@ class NDJSONReader:
             raise RuntimeError("reader 已经 close()，不能再 feed()")
         if not isinstance(chunk, (bytes, bytearray)):
             raise TypeError("feed() 只接受 bytes，收到 %s" % type(chunk).__name__)
-        self._buf += bytes(chunk).decode("utf-8")
-        return self._drain()
+        self._buf += chunk
+        return self._drain(final=False)
 
     def close(self):
         """声明输入结束，返回剩余记录。可以重复调用。"""
+        if self._closed:
+            return []
         self._closed = True
-        self._buf = ""
-        return []
+        return self._drain(final=True)
 
     # -- 内部 ---------------------------------------------------------
 
-    def _drain(self):
-        # 末尾没有换行的部分可能只是个半行，留到下一次 feed；前面的都是完整行。
-        cut = self._buf.rfind("\n")
-        if cut < 0:
-            return []
-        block, self._buf = self._buf[:cut], self._buf[cut + 1:]
+    def _drain(self, final):
         out = []
-        for line in block.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            out.append(self._parse(line))
+        if not self._strip_bom(final):
+            # 缓冲里的字节还不足以判断是不是 BOM，等下一块。
+            return out
+        buf = self._buf
+        while True:
+            idx = buf.find(_NEWLINE, self._scan)
+            if idx < 0:
+                self._scan = len(buf)
+                break
+            record = self._parse_line(buf[self._head:idx])
+            self._head = idx + 1
+            self._scan = self._head
+            if record is not None:
+                out.append(record)
+        if final:
+            if self._head < len(buf):
+                record = self._parse_line(buf[self._head:])
+                if record is not None:
+                    out.append(record)
+            buf.clear()
+            self._head = self._scan = 0
+        elif self._head == len(buf):
+            buf.clear()
+            self._head = self._scan = 0
+        elif self._head >= _COMPACT_THRESHOLD:
+            del buf[:self._head]
+            self._scan -= self._head
+            self._head = 0
         return out
 
-    def _parse(self, line):
+    def _strip_bom(self, final):
+        """跳过流开头的 BOM；返回 False 表示现有字节不足以判断。"""
+        if self._bom_done:
+            return True
+        avail = len(self._buf) - self._head
+        if avail >= len(_BOM):
+            if self._buf[self._head:self._head + len(_BOM)] == _BOM:
+                self._head += len(_BOM)
+                self._scan = max(self._scan, self._head)
+            self._bom_done = True
+            return True
+        head = bytes(self._buf[self._head:])
+        if not final and _BOM.startswith(head):
+            return False
+        self._bom_done = True
+        return True
+
+    def _parse_line(self, raw):
+        """解析一整行；空白行返回 None。"""
         try:
-            value = json.loads(line)
+            text = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise StreamDecodeError(
+                "第 %d 条记录不是合法 UTF-8: %s" % (self._count + 1, exc)
+            ) from exc
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
         except ValueError as exc:
             raise StreamDecodeError(
                 "第 %d 条之后的记录不是合法 JSON: %s" % (self._count, exc)
